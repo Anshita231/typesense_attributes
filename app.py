@@ -1,10 +1,15 @@
 from flask import Flask, render_template, request, jsonify
 import typesense
 import os
+import re
 from dotenv import load_dotenv
 from query_attributes import search_by_attributes
-from attr_normalize import strip_attr_field_suffix
+from attr_normalize import attr_field_name, get_product_attr_schema
 load_dotenv()
+_NUMERIC_VALUE_RE = re.compile(r"^-?\d+(\.\d+)?$")
+
+def _is_numeric_value(value):
+    return bool(_NUMERIC_VALUE_RE.fullmatch(str(value).strip()))
 
 def is_temporary(product):
     val = product.get("isTemporary", False)
@@ -22,7 +27,10 @@ def sort_priority(product):
         vendor_rank = 1
     else:
         vendor_rank = 2
-    return (1 if is_temporary(product) else 0, vendor_rank)
+    unmatched_count = len(product.get("unmatchedAttributes", {}) or {})
+    match_type_rank = 0 if product.get("matchType", "exact") == "exact" else 1
+
+    return (1 if is_temporary(product) else 0, unmatched_count, match_type_rank, vendor_rank)
 
 def attach_vmi_tags(output, client):
     if not output:
@@ -54,6 +62,7 @@ def attach_vmi_tags(output, client):
 
     return output
 
+
 app = Flask(__name__)
 
 client = typesense.Client({
@@ -83,13 +92,40 @@ def search_attributes():
     print(f"[search_attributes] tier={meta.get('tier')} attrs_used={meta.get('attrs_used')} "
           f"attrs_requested={meta.get('attrs_requested')} dropped={meta.get('dropped')}")
 
-    stored_attrs_by_mid = {
-        d.get("materialId"): {
-            strip_attr_field_suffix(k): v for k, v in d.items()
-            if k not in ("id", "materialId", "materialIdStr", "productName", "brandName", "categoryId")
+    requested = meta.get("attrs_requested", {}) or {}
+    product_schema = get_product_attr_schema().get(product_name)
+
+    def _schema_note(key):
+        if product_schema is None:
+            return ""
+        if key not in product_schema:
+            return " (not a recognized attribute for this product type)"
+        return "" if product_schema.get(key) == 1 else " (non-mandatory)"
+
+    match_info_by_mid = {}
+    for d in attr_docs:
+        mid = d.get("materialId")
+
+        matched = {}
+        unmatched = {}
+        for key, requested_val in requested.items():
+            note = _schema_note(key)
+            stored_val = d.get(attr_field_name(key))
+
+            if stored_val is None:
+                unmatched[key] = f"Not Defined{note}"
+            elif str(stored_val).strip().lower() == str(requested_val).strip().lower():
+                matched[key] = stored_val
+            elif _is_numeric_value(requested_val) or _is_numeric_value(stored_val):
+                unmatched[key] = f"{stored_val} (expected: {requested_val}){note}"
+            else:
+                matched[key] = f"{stored_val} (expected: {requested_val}){note}"
+
+        match_info_by_mid[mid] = {
+            "matchType": d.get("_matchType", "exact"),
+            "matchedAttributes": matched,
+            "unmatchedAttributes": unmatched,
         }
-        for d in attr_docs
-    }
 
     if not attr_docs:
         return jsonify({"meta": meta, "results": []})
@@ -138,6 +174,7 @@ def search_attributes():
         if not doc:
             continue
         is_temp = is_temp_by_mid.get(mid, False)
+        info = match_info_by_mid.get(mid, {})
         output.append({
             'productName': doc.get('productName', ''),
             'brandName': doc.get('brandName', ''),
@@ -150,7 +187,9 @@ def search_attributes():
             'vendors': [] if is_temp else doc.get('vendors', []),
             'ARCvendors': doc.get('ARCvendors', []),
             'isTemporary': 'true' if is_temp else 'false',
-            'matchedAttributes': stored_attrs_by_mid.get(mid, {}),
+            'matchedAttributes': info.get('matchedAttributes', {}),
+            'matchType': info.get('matchType', 'exact'),
+            'unmatchedAttributes': info.get('unmatchedAttributes', []),
         })
 
     output.sort(key=sort_priority)

@@ -1,11 +1,11 @@
-MIN_RESULTS = 5 
+MIN_RESULTS = 5
 CONDUCTOR_MATERIAL_KEY = "conductor_material"
 CONTAINS_FALLBACK_KEYS = ["conductor_material", "armouring"]
-COLLECTION_NAME = "AttributesJSON"
-RESERVED_KEYS = {"productname", "brandname"}
-
 import re
 from attr_normalize import normalize_attr_value, slugify_attr, get_product_attr_schema, attr_field_name
+
+COLLECTION_NAME = "AttributesJSON"
+RESERVED_KEYS = {"productname", "brandname"}
 
 def parse_attr_string(raw):
     result = {}
@@ -71,8 +71,39 @@ def _merge_docs(primary_docs, secondary_docs):
             seen_ids.add(mid)
     return merged
 
+def _fuzzy_fields_for_doc(doc, attrs, text_keys):
+    fuzzy = []
+    for k in text_keys:
+        stored_val = doc.get(attr_field_name(k))
+        if stored_val is None:
+            continue
+        if str(stored_val).strip().lower() != str(attrs.get(k)).strip().lower():
+            fuzzy.append(k)
+    return fuzzy
+
+def _add_unmatched(docs, unmatched_keys):
+    if not unmatched_keys:
+        return docs
+    for d in docs:
+        existing = set(d.get("_unmatchedAttrs", []))
+        d["_unmatchedAttrs"] = sorted(existing | set(unmatched_keys))
+    return docs
+
+def _finalize_tags(docs, extra_unmatched=None):
+    for d in docs:
+        d.setdefault("_matchType", "exact")
+        d.setdefault("_fuzzyAttrs", [])
+        d.setdefault("_unmatchedAttrs", [])
+    if extra_unmatched:
+        _add_unmatched(docs, extra_unmatched)
+    return docs
+
+
 def _exact_plus_contains_search(client, product_name, brand_name, attrs, per_page=100):
     exact_docs = _run_search(client, _build_filter(product_name, brand_name, attrs), per_page)
+    for d in exact_docs:
+        d["_matchType"] = "exact"
+        d["_fuzzyAttrs"] = []
 
     text_keys = {k for k, v in attrs.items() if _is_text_value(v)}
     if not text_keys:
@@ -83,8 +114,15 @@ def _exact_plus_contains_search(client, product_name, brand_name, attrs, per_pag
         _build_filter(product_name, brand_name, attrs, contains_keys=text_keys),
         per_page,
     )
-    merged = _merge_docs(exact_docs, contains_docs)
+    exact_ids = {d.get("materialId") for d in exact_docs}
+    new_contains_docs = [d for d in contains_docs if d.get("materialId") not in exact_ids]
+    for d in new_contains_docs:
+        d["_matchType"] = "contains"
+        d["_fuzzyAttrs"] = _fuzzy_fields_for_doc(d, attrs, text_keys)
+
+    merged = exact_docs + new_contains_docs
     return merged, text_keys
+
 
 def search_by_attributes(client, product_name, brand_name, raw_attr_string, per_page=100, min_results=MIN_RESULTS):
     parsed = parse_attr_string(raw_attr_string)
@@ -98,6 +136,7 @@ def search_by_attributes(client, product_name, brand_name, raw_attr_string, per_
 
     if not attrs:
         docs = _run_search(client, _build_filter(product_name, brand_name, {}), per_page)
+        _finalize_tags(docs)
         return docs, {"tier": "brand_product_only", "attrs_used": [], "attrs_requested": {}}
 
     schema = get_product_attr_schema()
@@ -109,6 +148,7 @@ def search_by_attributes(client, product_name, brand_name, raw_attr_string, per_
 
         if not recognized:
             docs = _run_search(client, _build_filter(product_name, brand_name, {}), per_page)
+            _finalize_tags(docs, extra_unmatched=unrecognized_dropped)
             return docs, {
                 "tier": "brand_product_only",
                 "attrs_used": [],
@@ -121,6 +161,7 @@ def search_by_attributes(client, product_name, brand_name, raw_attr_string, per_
         )
 
         if len(full_docs) >= min_results:
+            _finalize_tags(full_docs, extra_unmatched=unrecognized_dropped)
             meta = {
                 "tier": "full_match",
                 "attrs_used": recognized,
@@ -133,6 +174,7 @@ def search_by_attributes(client, product_name, brand_name, raw_attr_string, per_
                 meta["tier"] = "dropped_unrecognized"
                 meta["dropped"] = list(unrecognized_dropped)
             return full_docs, meta
+
         mandatory_only = {k: v for k, v in recognized.items() if product_schema.get(k) == 1}
         optional_dropped = set(recognized) - set(mandatory_only)
 
@@ -140,13 +182,17 @@ def search_by_attributes(client, product_name, brand_name, raw_attr_string, per_
             mandatory_docs, mandatory_contains_keys_used = _exact_plus_contains_search(
                 client, product_name, brand_name, mandatory_only, per_page
             )
+            full_ids = {d.get("materialId") for d in full_docs}
             merged = _merge_docs(full_docs, mandatory_docs)
+            newly_added = [d for d in merged if d.get("materialId") not in full_ids]
+            _add_unmatched(newly_added, optional_dropped)
             merged = merged[:per_page]
 
             if merged:
                 tier = "full_match" if not unrecognized_dropped else "dropped_unrecognized"
                 if len(merged) > len(full_docs):
                     tier = "augmented_with_mandatory_only" if full_docs else "mandatory_only"
+                _finalize_tags(merged, extra_unmatched=unrecognized_dropped)
                 meta = {
                     "tier": tier,
                     "attrs_used": recognized if full_docs else mandatory_only,
@@ -164,6 +210,7 @@ def search_by_attributes(client, product_name, brand_name, raw_attr_string, per_
                 return merged, meta
 
         if full_docs:
+            _finalize_tags(full_docs, extra_unmatched=unrecognized_dropped)
             meta = {
                 "tier": "full_match",
                 "attrs_used": recognized,
@@ -178,6 +225,9 @@ def search_by_attributes(client, product_name, brand_name, raw_attr_string, per_
             return full_docs, meta
 
         base_for_drop = mandatory_only if mandatory_only else recognized
+        base_unmatched = set(unrecognized_dropped)
+        if mandatory_only:
+            base_unmatched |= optional_dropped
 
         for contains_key in CONTAINS_FALLBACK_KEYS:
             if contains_key not in base_for_drop:
@@ -197,6 +247,10 @@ def search_by_attributes(client, product_name, brand_name, raw_attr_string, per_
                 if val not in seen_values:
                     seen_values.append(val)
                     deduped.append(d)
+            for d in deduped:
+                d["_matchType"] = "contains"
+                d["_fuzzyAttrs"] = _fuzzy_fields_for_doc(d, base_for_drop, {contains_key})
+            _finalize_tags(deduped, extra_unmatched=base_unmatched)
             return deduped, {
                 "tier": f"contains_{contains_key}",
                 "attrs_used": base_for_drop,
@@ -220,6 +274,7 @@ def search_by_attributes(client, product_name, brand_name, raw_attr_string, per_
                         if val not in seen_values:
                             seen_values.append(val)
                             deduped.append(d)
+                    _finalize_tags(deduped, extra_unmatched=base_unmatched | {CONDUCTOR_MATERIAL_KEY})
                     return deduped, {
                         "tier": "dropped_conductor_material",
                         "attrs_used": without_conductor_material,
@@ -236,8 +291,10 @@ def search_by_attributes(client, product_name, brand_name, raw_attr_string, per_
             "attrs_requested": attrs,
             "dropped": list(unrecognized_dropped),
         }
+
     docs, contains_keys_used = _exact_plus_contains_search(client, product_name, brand_name, attrs, per_page)
     if docs:
+        _finalize_tags(docs)
         meta = {"tier": "full_match", "attrs_used": attrs, "attrs_requested": attrs}
         if contains_keys_used:
             meta["contains_merged_keys"] = list(contains_keys_used)
@@ -247,12 +304,14 @@ def search_by_attributes(client, product_name, brand_name, raw_attr_string, per_
     while remaining:
         remaining = remaining[:-1]
         current = dict(remaining)
-        docs, contains_keys_used = _exact_plus_contains_search(
-            client, product_name, brand_name, current, per_page
-        ) if current else (
-            _run_search(client, _build_filter(product_name, brand_name, {}), per_page), set()
-        )
+        dropped_so_far = set(attrs) - set(current)
+        if current:
+            docs, contains_keys_used = _exact_plus_contains_search(client, product_name, brand_name, current, per_page)
+        else:
+            docs = _run_search(client, _build_filter(product_name, brand_name, {}), per_page)
+            contains_keys_used = set()
         if docs:
+            _finalize_tags(docs, extra_unmatched=dropped_so_far)
             meta = {
                 "tier": "unmapped_product_dropped",
                 "attrs_used": current,
@@ -260,6 +319,8 @@ def search_by_attributes(client, product_name, brand_name, raw_attr_string, per_
             }
             if contains_keys_used:
                 meta["contains_merged_keys"] = list(contains_keys_used)
+            if dropped_so_far:
+                meta["dropped"] = list(dropped_so_far)
             return docs, meta
 
     return [], {

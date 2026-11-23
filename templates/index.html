@@ -37,6 +37,8 @@
         th, td { padding:4px 10px; text-align:left; }
         th { background:#f9fafb; }
         .attr-table { background:#fafafa; border-radius:6px; }
+        .unmatched-note { font-size:12px; color:#b91c1c; margin:8px 4px 0 4px; font-weight:bold; }
+        .unmatched-table td { color:#b91c1c; }
         .vendor-block {
             margin-top:12px; padding:10px;
             border-radius:6px; font-size:14px;
@@ -184,15 +186,32 @@ function buildVrcHtml(vrcVendors, productId) {
     return html;
 }
 
-function buildAttrsHtml(matchedAttributes) {
-    const entries = Object.entries(matchedAttributes || {});
-    if (entries.length === 0) return "";
+function buildAttrsHtml(product) {
+    const matchedAttributes = product.matchedAttributes || {};
+    const unmatchedAttributes = product.unmatchedAttributes || {};
+    const matchedEntries = Object.entries(matchedAttributes);
+    const unmatchedEntries = Object.entries(unmatchedAttributes);
+    if (matchedEntries.length === 0 && unmatchedEntries.length === 0) return "";
 
-    let rows = entries.map(([k, v]) => `<tr><td><b>${k}</b></td><td>${v}</td></tr>`).join("");
+    const matchedRows = matchedEntries
+        .map(([k, v]) => `<tr><td><b>${k}</b></td><td>${v}</td></tr>`)
+        .join("");
+
+    const unmatchedRows = unmatchedEntries
+        .map(([k, note]) => `<tr><td><b>${k}</b></td><td>${note}</td></tr>`)
+        .join("");
+
+    const summaryLabel = `Matched (${matchedEntries.length})` +
+        (unmatchedEntries.length ? `, Unmatched (${unmatchedEntries.length})` : "");
+
     return `
         <details>
-            <summary>Attributes (${entries.length})</summary>
-            <table class="attr-table">${rows}</table>
+            <summary>${summaryLabel}</summary>
+            ${matchedEntries.length ? `<table class="attr-table">${matchedRows}</table>` : ""}
+            ${unmatchedEntries.length ? `
+                <p class="unmatched-note">Unmatched</p>
+                <table class="attr-table unmatched-table">${unmatchedRows}</table>
+            ` : ""}
         </details>
     `;
 }
@@ -232,6 +251,7 @@ function renderPage() {
                         ${hasVMI ? `<span class="vrc-tag" style="background:#9333ea;margin-left:8px;">VMI: ${vmiLinkedIds.join(', ')}</span>` : ''}
                     </h3>
                     <div style="display:flex;gap:8px;">
+                        ${product.matchType === 'contains' ? '<span class="vrc-tag" style="background:#d97706;">Approximate match</span>' : ''}
                         ${hasARC ? '<span class="vrc-tag" style="background:#2563eb;">ARC</span>' : ''}
                         ${hasVRC ? '<span class="vrc-tag">VRC</span>' : ''}
                     </div>
@@ -250,7 +270,7 @@ function renderPage() {
                     &nbsp;&nbsp;&nbsp;&nbsp;
                     <b>UOM:</b> ${product.UOM || "-"}
                 </p>
-                ${buildAttrsHtml(product.matchedAttributes)}
+                ${buildAttrsHtml(product)}
                 ${buildArcHtml(arcVendors, productId)}
                 ${buildVrcHtml(vrcVendors, productId)}
             </div>
